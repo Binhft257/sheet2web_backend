@@ -27,16 +27,12 @@ import {
 } from '../../common/enums/database.enums';
 import { GoogleSheetsService } from '../../google-sheets/google-sheets.service';
 import { extractSpreadsheetId } from './utils/extract-spreadsheet-id';
+import { randomUUID } from 'node:crypto';
 import {
   GoogleSheetTabMetadata,
   GoogleSheetsMetadata,
 } from '../../google-sheets/types/google-sheets-metadata.type';
-import {
-  buildA1Range,
-  escapeSheetName,
-  PREVIEW_MAX_ROWS,
-  validateRangeA1Notation,
-} from './utils/sheet-range.util';
+import { PREVIEW_MAX_ROWS } from './utils/sheet-range.util';
 
 @Injectable()
 export class DataSourcesService {
@@ -230,6 +226,17 @@ export class DataSourcesService {
     dataSourceId: string,
     updateDataSourceDto: UpdateDataSourceDto,
   ) {
+    const original = await this.typeOrmDataSource.manager.findOne(
+      DataSourceEntity,
+      {
+        where: { id: dataSourceId, deletedAt: IsNull() },
+      },
+    );
+    if (!original) throw new NotFoundException('Không tìm thấy data source');
+    if (original.ownerId !== userId)
+      throw new ForbiddenException('Bạn không có quyền sửa data source này.');
+    const expectedStructureTime =
+      original.lastSyncedStructureAt?.getTime() ?? null;
     const incomingSourceUrl = updateDataSourceDto.sourceUrl;
     const hasSourceUrl = typeof incomingSourceUrl === 'string';
     const hasTitle = typeof updateDataSourceDto.title === 'string';
@@ -241,6 +248,11 @@ export class DataSourcesService {
     if (hasSourceUrl) {
       sourceUrl = incomingSourceUrl.trim();
       spreadsheetId = extractSpreadsheetId(sourceUrl);
+      if (original.spreadsheetId && original.spreadsheetId !== spreadsheetId) {
+        throw new ConflictException(
+          'Không thể thay spreadsheet của nguồn hiện có vì có thể xóa các trang liên quan. Hãy thêm nguồn mới.',
+        );
+      }
       metadata =
         await this.googleSheetsService.getSpreadsheetMetadata(spreadsheetId);
       this.validateMetadataHasSheets(metadata);
@@ -250,6 +262,7 @@ export class DataSourcesService {
       return await this.typeOrmDataSource.transaction(async (manager) => {
         const dataSource = await manager.findOne(DataSourceEntity, {
           where: { id: dataSourceId, deletedAt: IsNull() },
+          lock: { mode: 'pessimistic_write' },
         });
 
         if (!dataSource) {
@@ -259,6 +272,17 @@ export class DataSourcesService {
         if (dataSource.ownerId !== userId) {
           throw new ForbiddenException(
             'Bạn không có quyền sửa data source này.',
+          );
+        }
+
+        if (
+          metadata &&
+          (dataSource.spreadsheetId !== original.spreadsheetId ||
+            (dataSource.lastSyncedStructureAt?.getTime() ?? null) !==
+              expectedStructureTime)
+        ) {
+          throw new ConflictException(
+            'Nguồn vừa được đồng bộ bởi yêu cầu khác. Vui lòng thử lại.',
           );
         }
 
@@ -427,34 +451,25 @@ export class DataSourcesService {
     }
 
     const normalizedRange = previewDataSourceDto.rangeA1Notation.trim();
-    const safeRangeA1Notation = normalizedRange
-      ? validateRangeA1Notation(normalizedRange)
-      : '';
-    const fullRange = safeRangeA1Notation
-      ? buildA1Range(sourceSheet.sheetName, safeRangeA1Notation)
-      : escapeSheetName(sourceSheet.sheetName);
-
-    const values = await this.googleSheetsService.getValues(
-      dataSource.spreadsheetId,
-      fullRange,
-    );
-
-    const useFirstRowAsHeader =
-      previewDataSourceDto.useFirstRowAsHeader ?? true;
-    const { headers, rows } = this.normalizePreviewRows(
-      values,
-      useFirstRowAsHeader,
-      PREVIEW_MAX_ROWS,
-    );
-
+    const result = await this.googleSheetsService.getGridSnapshot({
+      spreadsheetId: dataSource.spreadsheetId,
+      googleSheetId: sourceSheet.googleSheetId,
+      sheetName: sourceSheet.sheetName,
+      rangeA1Notation: normalizedRange || undefined,
+      useFirstRowAsHeader: previewDataSourceDto.useFirstRowAsHeader ?? true,
+      previewRows: PREVIEW_MAX_ROWS,
+    });
     return {
       dataSourceId: dataSource.id,
       sourceSheetId: sourceSheet.id,
-      sheetName: sourceSheet.sheetName,
-      rangeA1Notation: safeRangeA1Notation,
-      headers,
-      rows,
-      rowCount: rows.length,
+      sheetName: result.sheetName,
+      rangeA1Notation: normalizedRange,
+      headers: result.headers,
+      rows: result.rows,
+      rowCount: result.rowCount,
+      gridLayout: result.gridLayout,
+      issues: result.issues,
+      previewMeta: { truncated: result.truncated },
       previewedAt: new Date().toISOString(),
     };
   }
@@ -463,6 +478,15 @@ export class DataSourcesService {
     if (metadata.sheets.length === 0) {
       throw new BadRequestException(
         'Google Sheet không có sheet nào để đồng bộ',
+      );
+    }
+    const ids = metadata.sheets.map((sheet) => sheet.googleSheetId);
+    if (
+      ids.some((id) => !Number.isSafeInteger(id) || id < 0) ||
+      new Set(ids).size !== ids.length
+    ) {
+      throw new BadRequestException(
+        'Metadata tab chưa hợp lệ. Không thực hiện đồng bộ hoặc xóa trang.',
       );
     }
   }
@@ -495,43 +519,6 @@ export class DataSourcesService {
       sortOrder: sheet.sortOrder,
       isHidden: sheet.isHidden,
       metadataJson: sheet.metadataJson,
-    };
-  }
-
-  private normalizePreviewRows(
-    values: string[][],
-    useFirstRowAsHeader: boolean,
-    maxRows: number,
-  ) {
-    if (!values.length) {
-      return {
-        headers: [] as string[],
-        rows: [] as string[][],
-      };
-    }
-
-    if (useFirstRowAsHeader) {
-      const [headerRow, ...restRows] = values;
-      const rows = restRows.slice(0, maxRows);
-      return {
-        headers: [...headerRow],
-        rows,
-      };
-    }
-
-    const rows = values.slice(0, maxRows);
-    const maxColumns = rows.reduce(
-      (currentMax, row) => Math.max(currentMax, row.length),
-      0,
-    );
-    const headers = Array.from(
-      { length: maxColumns },
-      (_, index) => `Column ${index + 1}`,
-    );
-
-    return {
-      headers,
-      rows,
     };
   }
 
@@ -634,18 +621,12 @@ export class DataSourcesService {
     dataSourceId: string,
     metadata: GoogleSheetsMetadata,
   ) {
+    this.validateMetadataHasSheets(metadata);
     const sourceSheetPayloads = metadata.sheets.map((sheet) => ({
       ...this.buildSourceSheetData(dataSourceId, sheet),
       dataSourceId,
       metadataJson: sheet.metadataJson as Record<string, any>,
     }));
-
-    if (sourceSheetPayloads.length > 0) {
-      await manager.upsert(SourceSheet, sourceSheetPayloads, [
-        'dataSourceId',
-        'googleSheetId',
-      ]);
-    }
 
     const incomingGoogleSheetIds = sourceSheetPayloads
       .map((sheet) => sheet.googleSheetId)
@@ -654,25 +635,39 @@ export class DataSourcesService {
           typeof googleSheetId === 'number',
       );
 
-    if (incomingGoogleSheetIds.length === 0) {
-      await manager
-        .createQueryBuilder()
-        .delete()
-        .from(SourceSheet)
-        .where('data_source_id = :dataSourceId', { dataSourceId })
-        .execute();
-    } else {
-      await manager
-        .createQueryBuilder()
-        .delete()
-        .from(SourceSheet)
-        .where('data_source_id = :dataSourceId', { dataSourceId })
-        .andWhere(
-          '(google_sheet_id IS NULL OR google_sheet_id NOT IN (:...incomingGoogleSheetIds))',
-          { incomingGoogleSheetIds },
-        )
-        .execute();
+    // Only this owner-triggered transaction may remove confirmed absent tabs.
+    // Remove first so a new tab can safely reuse a deleted tab's unique name.
+    await manager
+      .createQueryBuilder()
+      .delete()
+      .from(SourceSheet)
+      .where('data_source_id = :dataSourceId', { dataSourceId })
+      .andWhere(
+        '(google_sheet_id IS NOT NULL AND google_sheet_id NOT IN (:...incomingGoogleSheetIds))',
+        { incomingGoogleSheetIds },
+      )
+      .execute();
+
+    const existing = await manager.find(SourceSheet, {
+      where: { dataSourceId },
+    });
+    for (const sheet of existing) {
+      const incoming = sourceSheetPayloads.find(
+        (value) => value.googleSheetId === sheet.googleSheetId,
+      );
+      if (incoming && incoming.sheetName !== sheet.sheetName) {
+        // Avoid unique-name conflicts when two stable tab IDs exchange names.
+        await manager.update(
+          SourceSheet,
+          { id: sheet.id, dataSourceId },
+          { sheetName: `__sheet2web_sync_${randomUUID()}` },
+        );
+      }
     }
+    await manager.upsert(SourceSheet, sourceSheetPayloads, [
+      'dataSourceId',
+      'googleSheetId',
+    ]);
 
     return manager.find(SourceSheet, {
       where: { dataSourceId },

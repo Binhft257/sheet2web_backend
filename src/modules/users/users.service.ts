@@ -48,7 +48,15 @@ export class UsersService {
   }
 
   async findOneByEmail(email: string) {
-    return await this.usersRepository.findOneBy({ email });
+    return await this.usersRepository.findOneBy({ email, deletedAt: IsNull() });
+  }
+
+  findActiveById(id: string) {
+    return this.usersRepository.findOneBy({
+      id,
+      deletedAt: IsNull(),
+      status: UserStatusEnum.ACTIVE,
+    });
   }
 
   findOne(id: string) {
@@ -67,9 +75,32 @@ export class UsersService {
     return this.toProfileResponse(user);
   }
 
-  update(id: string, updateUserDto: UpdateUserDto) {
-    this.usersRepository.update(id, updateUserDto);
-    return this.usersRepository.findOneBy({ id });
+  async update(id: string, updateUserDto: UpdateUserDto) {
+    const changes = { ...updateUserDto };
+    if (!Object.keys(changes).length) {
+      const user = await this.usersRepository.findOneBy({
+        id,
+        deletedAt: IsNull(),
+      });
+      if (!user) throw new NotFoundException('Không tìm thấy user');
+      return user;
+    }
+    if (changes.passwordHash !== undefined) {
+      if (
+        typeof changes.passwordHash !== 'string' ||
+        !changes.passwordHash.trim()
+      ) {
+        throw new BadRequestException('Mật khẩu không được để trống.');
+      }
+      changes.passwordHash = await hashPassword(changes.passwordHash);
+    }
+
+    const result = await this.usersRepository.update(
+      { id, deletedAt: IsNull() },
+      changes,
+    );
+    if (!result.affected) throw new NotFoundException('Không tìm thấy user');
+    return this.usersRepository.findOneBy({ id, deletedAt: IsNull() });
   }
 
   async remove(id: string) {

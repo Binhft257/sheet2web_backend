@@ -1,11 +1,8 @@
 import { Strategy } from 'passport-local';
 import { PassportStrategy } from '@nestjs/passport';
-import {
-  BadRequestException,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { AuthService } from '../auth.service';
+import { UserStatusEnum } from '../../common/enums/database.enums';
 
 @Injectable()
 export class LocalStrategy extends PassportStrategy(Strategy) {
@@ -16,9 +13,9 @@ export class LocalStrategy extends PassportStrategy(Strategy) {
     });
   }
 
-  async validate(email: string, passwordHash: string): Promise<any> {
+  async validate(email: string, passwordHash: string) {
     const user = await this.authService.validateUser(email, passwordHash);
-    if (user.status === 'inactive') {
+    if (user.status === UserStatusEnum.INACTIVE) {
       throw new BadRequestException('Tài khoản chưa được kích hoạt');
     }
     return user;

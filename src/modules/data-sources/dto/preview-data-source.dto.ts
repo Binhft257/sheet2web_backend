@@ -10,8 +10,9 @@ export class PreviewDataSourceDto {
   sourceSheetId!: string;
 
   @ApiProperty({
-    example: 'Sheet1!A1:D20',
-    description: 'Vùng dữ liệu theo định dạng A1 cần xem trước.',
+    example: 'A1:D20',
+    description:
+      'Range A1 không kèm tên tab; chuỗi rỗng để xem toàn bộ sheet. Preview dùng GridLayout v1 và có thể trả truncated.',
   })
   @IsString()
   rangeA1Notation!: string;

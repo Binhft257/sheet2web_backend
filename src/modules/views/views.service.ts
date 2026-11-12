@@ -3,10 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
-  Logger,
   NotFoundException,
-  OnModuleDestroy,
-  OnModuleInit,
 } from '@nestjs/common';
 import { CreateViewDto } from './dto/create-view.dto';
 import { ListMyViewsQueryDto } from './dto/list-my-views-query.dto';
@@ -40,35 +37,40 @@ import { ViewSnapshot } from '../view-snapshots/entities/view-snapshot.entity';
 import { ViewPermission } from '../view-permissions/entities/view-permission.entity';
 import { ShareToken } from '../share-tokens/entities/share-token.entity';
 import { hashShareToken } from '../share-tokens/utils/share-token.util';
+import { readGridSnapshotMetadata } from '../../google-sheets/grid/grid-snapshot.metadata';
+import { hashGridSnapshot } from '../../google-sheets/grid/grid-snapshot.hash';
+
+type PublicationResult = {
+  id: string;
+  slug: string;
+  status: ViewStatusEnum;
+  publishedAt: Date | null | undefined;
+  snapshot: {
+    id: string;
+    versionNo: number;
+    rowCount: number;
+    fetchedAt: Date | null | undefined;
+  };
+  url: string;
+};
+
+type PublicationRequest = {
+  mode: 'manual' | 'background';
+  changes?: UpdateViewDto;
+};
 
 @Injectable()
-export class ViewsService implements OnModuleInit, OnModuleDestroy {
-  private static readonly AUTO_PUBLISH_INTERVAL_MS = 10_000;
-  private readonly logger = new Logger(ViewsService.name);
-  private autoPublishInterval: NodeJS.Timeout | null = null;
-  private isAutoPublishRunning = false;
+export class ViewsService {
+  private readonly publications = new Map<
+    string,
+    PublicationRequest & { promise: Promise<PublicationResult> }
+  >();
 
   constructor(
     @InjectDataSource()
     private readonly typeOrmDataSource: TypeOrmDataSource,
     private readonly googleSheetsService: GoogleSheetsService,
   ) {}
-
-  onModuleInit() {
-    void this.autoPublishViews();
-    this.autoPublishInterval = setInterval(() => {
-      void this.autoPublishViews();
-    }, ViewsService.AUTO_PUBLISH_INTERVAL_MS);
-  }
-
-  onModuleDestroy() {
-    if (!this.autoPublishInterval) {
-      return;
-    }
-
-    clearInterval(this.autoPublishInterval);
-    this.autoPublishInterval = null;
-  }
 
   async listMy(userId: string, listMyViewsQueryDto: ListMyViewsQueryDto) {
     const { page, limit, skip } = this.resolvePagination(
@@ -326,13 +328,18 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
     viewId: string,
     updateViewDto: UpdateViewDto,
   ) {
-    return this.updateByStatus(
-      userId,
-      viewId,
-      updateViewDto,
-      ViewStatusEnum.PUBLISHED,
-      'Chỉ có thể sửa view đã publish.',
-    );
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const publication = await this.runPublication(userId, viewId, {
+          mode: 'manual',
+          changes: updateViewDto,
+        });
+        return { ...(await this.findOne(userId, viewId)), publication };
+      } catch (error) {
+        if (!this.isSlugUniqueViolation(error)) throw error;
+      }
+    }
+    throw new ConflictException('Không thể tạo slug duy nhất cho view này.');
   }
 
   private async updateByStatus(
@@ -347,6 +354,7 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
         return await this.typeOrmDataSource.transaction(async (manager) => {
           const view = await manager.findOne(View, {
             where: { id: viewId, deletedAt: IsNull() },
+            lock: { mode: 'pessimistic_write' },
           });
 
           if (!view) {
@@ -361,105 +369,7 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
             throw new BadRequestException(invalidStatusMessage);
           }
 
-          const nextSelectionType =
-            updateViewDto.selectionType ?? view.selectionType;
-          const nextSourceSheetId =
-            updateViewDto.sourceSheetId !== undefined
-              ? updateViewDto.sourceSheetId
-              : view.sourceSheetId;
-          let normalizedRange: string | null;
-          if (nextSelectionType === SelectionTypeEnum.FULL_SHEET) {
-            const incomingRange =
-              typeof updateViewDto.rangeA1Notation === 'string'
-                ? updateViewDto.rangeA1Notation.trim()
-                : null;
-            if (incomingRange) {
-              throw new BadRequestException(
-                'full_sheet không cho phép rangeA1Notation.',
-              );
-            }
-            normalizedRange = null;
-          } else {
-            const rangeCandidate =
-              updateViewDto.rangeA1Notation !== undefined
-                ? updateViewDto.rangeA1Notation
-                : view.rangeA1Notation;
-            normalizedRange =
-              typeof rangeCandidate === 'string' ? rangeCandidate.trim() : null;
-          }
-
-          this.validateSelectionRules(
-            nextSelectionType,
-            nextSourceSheetId,
-            normalizedRange ?? undefined,
-          );
-
-          if (nextSelectionType === SelectionTypeEnum.RANGE) {
-            validateRangeA1Notation(
-              normalizedRange as string,
-              Number.MAX_SAFE_INTEGER,
-            );
-          }
-
-          const sourceSheet = await manager.findOne(SourceSheet, {
-            where: {
-              id: nextSourceSheetId!,
-              dataSourceId: view.dataSourceId,
-            },
-          });
-
-          if (!sourceSheet) {
-            throw new NotFoundException(
-              'Không tìm thấy sheet trong nguồn dữ liệu này.',
-            );
-          }
-
-          let nextName = view.name;
-          if (updateViewDto.name !== undefined) {
-            const normalizedName = updateViewDto.name.trim();
-            if (!normalizedName) {
-              throw new BadRequestException('name không được để trống.');
-            }
-            nextName = normalizedName;
-          }
-
-          if (nextName !== view.name) {
-            view.slug = await this.generateUniqueSlug(
-              manager,
-              nextName,
-              view.id,
-            );
-          }
-
-          view.name = nextName;
-          view.sourceSheetId = nextSourceSheetId;
-          view.selectionType = nextSelectionType;
-          view.rangeA1Notation =
-            nextSelectionType === SelectionTypeEnum.RANGE
-              ? (normalizedRange as string)
-              : null;
-
-          if (updateViewDto.accessMode !== undefined) {
-            view.accessMode = updateViewDto.accessMode;
-          }
-          if (updateViewDto.useFirstRowAsHeader !== undefined) {
-            view.useFirstRowAsHeader = updateViewDto.useFirstRowAsHeader;
-          }
-          if (updateViewDto.refreshIntervalSeconds !== undefined) {
-            view.refreshIntervalSeconds = updateViewDto.refreshIntervalSeconds;
-          }
-          if (updateViewDto.allowThemeSwitch !== undefined) {
-            view.allowThemeSwitch = updateViewDto.allowThemeSwitch;
-          }
-          if (updateViewDto.themeId !== undefined) {
-            view.themeId = updateViewDto.themeId ?? null;
-          }
-          if (updateViewDto.themeOverrideJson !== undefined) {
-            view.themeOverrideJson = updateViewDto.themeOverrideJson;
-          }
-          if (updateViewDto.settingsJson !== undefined) {
-            view.settingsJson = updateViewDto.settingsJson;
-          }
+          await this.applyViewChanges(manager, view, updateViewDto);
 
           const savedView = await manager.save(View, view);
           return this.toUpdateResponse(savedView);
@@ -475,7 +385,49 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
     throw new ConflictException('Không thể tạo slug duy nhất cho view này.');
   }
 
-  async publish(userId: string, viewId: string) {
+  async publish(
+    userId: string,
+    viewId: string,
+    mode: 'manual' | 'background' = 'manual',
+  ): Promise<PublicationResult> {
+    return this.runPublication(userId, viewId, { mode });
+  }
+
+  private async runPublication(
+    userId: string,
+    viewId: string,
+    request: PublicationRequest,
+  ): Promise<PublicationResult> {
+    // User ID is part of the key: callers must never borrow another owner's authorization.
+    const key = `${userId}:${viewId}`;
+    const existing = this.publications.get(key);
+    if (existing) {
+      if (
+        request.changes ||
+        existing.changes ||
+        (request.mode === 'manual' && existing.mode === 'background')
+      ) {
+        // Distinct edits must not borrow another request's configuration or failure.
+        await existing.promise.catch(() => undefined);
+        return this.runPublication(userId, viewId, request);
+      }
+      return existing.promise;
+    }
+    const promise = this.publishSnapshot(userId, viewId, request);
+    this.publications.set(key, { ...request, promise });
+    try {
+      return await promise;
+    } finally {
+      if (this.publications.get(key)?.promise === promise)
+        this.publications.delete(key);
+    }
+  }
+
+  private async publishSnapshot(
+    userId: string,
+    viewId: string,
+    { mode, changes }: PublicationRequest,
+  ): Promise<PublicationResult> {
     const view = await this.typeOrmDataSource.manager.findOne(View, {
       where: { id: viewId, deletedAt: IsNull() },
     });
@@ -488,7 +440,20 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
       throw new ForbiddenException('Bạn không có quyền publish view này.');
     }
 
-    this.validatePublishSelection(view);
+    if (changes && view.status !== ViewStatusEnum.PUBLISHED) {
+      throw new BadRequestException('Chỉ có thể sửa view đã publish.');
+    }
+
+    const expectedConfiguration = this.publicationConfiguration(view);
+    const candidate = Object.assign(new View(), view);
+    if (changes) {
+      await this.applyViewChanges(
+        this.typeOrmDataSource.manager,
+        candidate,
+        changes,
+      );
+    }
+    this.validatePublishSelection(candidate);
 
     const dataSource = await this.typeOrmDataSource.manager.findOne(
       DataSourceEntity,
@@ -518,7 +483,7 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
       SourceSheet,
       {
         where: {
-          id: view.sourceSheetId!,
+          id: candidate.sourceSheetId!,
           dataSourceId: view.dataSourceId,
         },
       },
@@ -530,19 +495,30 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const resolvedRange = this.resolvePublishRange(view, sourceSheet.sheetName);
-    const values = await this.googleSheetsService.getValues(
-      dataSource.spreadsheetId,
-      resolvedRange,
-    );
-    const { headers, rows } = this.normalizeSnapshotRows(
-      values,
-      view.useFirstRowAsHeader,
-    );
+    const baselineSnapshot = await this.typeOrmDataSource.manager
+      .createQueryBuilder(ViewSnapshot, 'snapshot')
+      .where('snapshot.view_id = :viewId', { viewId: view.id })
+      .andWhere('snapshot.is_current = true')
+      .orderBy('snapshot.version_no', 'DESC')
+      .getOne();
+    const grid = await this.googleSheetsService.getGridSnapshot({
+      spreadsheetId: dataSource.spreadsheetId,
+      googleSheetId: sourceSheet.googleSheetId,
+      sheetName: sourceSheet.sheetName,
+      rangeA1Notation:
+        candidate.selectionType === SelectionTypeEnum.RANGE
+          ? candidate.rangeA1Notation!
+          : undefined,
+      useFirstRowAsHeader: candidate.useFirstRowAsHeader,
+    });
+    const resolvedRange = this.resolvePublishRange(candidate, grid.sheetName);
+    const { headers, rows } = grid;
+    const dataHash = hashGridSnapshot(grid);
 
     return await this.typeOrmDataSource.transaction(async (manager) => {
       const freshView = await manager.findOne(View, {
         where: { id: view.id, deletedAt: IsNull() },
+        lock: { mode: 'pessimistic_write' },
       });
 
       if (!freshView) {
@@ -551,6 +527,40 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
 
       if (freshView.ownerId !== userId) {
         throw new ForbiddenException('Bạn không có quyền publish view này.');
+      }
+
+      if (this.publicationConfiguration(freshView) !== expectedConfiguration) {
+        throw new ConflictException(
+          'Cấu hình trang đã thay đổi trong lúc đọc. Vui lòng xuất bản lại.',
+        );
+      }
+      if (changes) {
+        Object.assign(freshView, this.viewConfiguration(candidate));
+      }
+      const currentSnapshot = await manager
+        .createQueryBuilder(ViewSnapshot, 'snapshot')
+        .where('snapshot.view_id = :viewId', { viewId: freshView.id })
+        .andWhere('snapshot.is_current = true')
+        .orderBy('snapshot.version_no', 'DESC')
+        .getOne();
+      if (
+        currentSnapshot?.id !== baselineSnapshot?.id &&
+        currentSnapshot?.dataHash !== dataHash
+      ) {
+        throw new ConflictException(
+          'Trang vừa được đồng bộ bởi tác vụ khác. Vui lòng thử lại.',
+        );
+      }
+      if (
+        currentSnapshot?.dataHash === dataHash &&
+        readGridSnapshotMetadata(currentSnapshot.resolvedMetaJson)
+      ) {
+        if (mode === 'manual') {
+          freshView.status = ViewStatusEnum.PUBLISHED;
+          freshView.lastPublishedAt = new Date();
+          await manager.save(View, freshView);
+        }
+        return this.publicationResponse(freshView, currentSnapshot);
       }
 
       await manager
@@ -577,10 +587,15 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
         versionNo: String(nextVersion),
         isCurrent: true,
         resolvedSelectionType: freshView.selectionType,
-        resolvedSheetNameSnapshot: sourceSheet.sheetName,
+        resolvedSheetNameSnapshot: grid.sheetName,
         resolvedTableNameSnapshot: null,
         resolvedRangeA1: resolvedRange,
-        resolvedMetaJson: {},
+        resolvedMetaJson: {
+          gridLayout: grid.gridLayout,
+          issues: grid.issues,
+          visibilityPolicyVersion: 1,
+        },
+        dataHash,
         headersJson: headers,
         rowsJson: rows,
         rowCount: rows.length,
@@ -606,19 +621,7 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
         await manager.delete(ViewSnapshot, staleSnapshotIds);
       }
 
-      return {
-        id: savedView.id,
-        slug: savedView.slug,
-        status: savedView.status,
-        publishedAt: savedView.lastPublishedAt,
-        snapshot: {
-          id: savedSnapshot.id,
-          versionNo: Number(savedSnapshot.versionNo),
-          rowCount: savedSnapshot.rowCount,
-          fetchedAt: savedSnapshot.fetchedAt,
-        },
-        url: `/v/${savedView.slug}`,
-      };
+      return this.publicationResponse(savedView, savedSnapshot);
     });
   }
 
@@ -703,6 +706,7 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
         view,
         userId,
         shareToken,
+        Boolean(readGridSnapshotMetadata(currentSnapshot.resolvedMetaJson)),
       );
 
       if (!canView) {
@@ -741,6 +745,7 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
     view: View,
     userId?: string,
     shareToken?: string,
+    consumeTokenUse = true,
   ) {
     if (userId && view.ownerId === userId) {
       return true;
@@ -761,10 +766,14 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    return this.isValidShareToken(view.id, shareToken);
+    return this.isValidShareToken(view.id, shareToken, consumeTokenUse);
   }
 
-  private async isValidShareToken(viewId: string, shareToken?: string) {
+  private async isValidShareToken(
+    viewId: string,
+    shareToken?: string,
+    consumeUse = true,
+  ) {
     const normalizedToken = shareToken?.trim();
     if (!normalizedToken) {
       return false;
@@ -794,9 +803,12 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
       return false;
     }
 
-    savedToken.usedCount += 1;
-    savedToken.lastUsedAt = now;
-    await this.typeOrmDataSource.manager.save(ShareToken, savedToken);
+    // A 409 response contains no usable page and must not consume a limited share link.
+    if (consumeUse) {
+      savedToken.usedCount += 1;
+      savedToken.lastUsedAt = now;
+      await this.typeOrmDataSource.manager.save(ShareToken, savedToken);
+    }
 
     return true;
   }
@@ -867,40 +879,6 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
       Number.MAX_SAFE_INTEGER,
     );
     return buildA1Range(sheetName, safeRange);
-  }
-
-  private normalizeSnapshotRows(
-    values: string[][],
-    useFirstRowAsHeader: boolean,
-  ) {
-    if (!values.length) {
-      return {
-        headers: [] as string[],
-        rows: [] as string[][],
-      };
-    }
-
-    if (useFirstRowAsHeader) {
-      const [headerRow, ...restRows] = values;
-      return {
-        headers: [...headerRow],
-        rows: restRows,
-      };
-    }
-
-    const maxColumns = values.reduce(
-      (currentMax, row) => Math.max(currentMax, row.length),
-      0,
-    );
-    const headers = Array.from(
-      { length: maxColumns },
-      (_, index) => `Column ${index + 1}`,
-    );
-
-    return {
-      headers,
-      rows: values,
-    };
   }
 
   private async generateUniqueSlug(
@@ -1021,6 +999,13 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
   }
 
   private toPublishedResponse(view: View, currentSnapshot: ViewSnapshot) {
+    const metadata = readGridSnapshotMetadata(currentSnapshot.resolvedMetaJson);
+    if (!metadata) {
+      // Historical snapshots have no visibility evidence. Never expose them through a legacy fallback.
+      throw new ConflictException(
+        'Trang cần được xuất bản hoặc đồng bộ lại để kiểm tra dữ liệu ẩn.',
+      );
+    }
     return {
       view: {
         id: view.id,
@@ -1044,6 +1029,8 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
           : [],
         rowCount: currentSnapshot.rowCount,
         fetchedAt: currentSnapshot.fetchedAt,
+        gridLayout: metadata.gridLayout,
+        issues: metadata.issues,
       },
     };
   }
@@ -1107,33 +1094,122 @@ export class ViewsService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  private async autoPublishViews() {
-    if (this.isAutoPublishRunning) {
-      return;
+  private async applyViewChanges(
+    manager: EntityManager,
+    view: View,
+    changes: UpdateViewDto,
+  ): Promise<void> {
+    const selectionType = changes.selectionType ?? view.selectionType;
+    const sourceSheetId =
+      changes.sourceSheetId !== undefined
+        ? changes.sourceSheetId
+        : view.sourceSheetId;
+    const rangeValue =
+      changes.rangeA1Notation !== undefined
+        ? changes.rangeA1Notation
+        : view.rangeA1Notation;
+    const range = typeof rangeValue === 'string' ? rangeValue.trim() : null;
+    if (
+      selectionType === SelectionTypeEnum.FULL_SHEET &&
+      typeof changes.rangeA1Notation === 'string' &&
+      changes.rangeA1Notation.trim()
+    ) {
+      throw new BadRequestException(
+        'full_sheet không cho phép rangeA1Notation.',
+      );
     }
-
-    this.isAutoPublishRunning = true;
-    try {
-      const publishedViews = await this.typeOrmDataSource.manager.find(View, {
-        where: {
-          status: ViewStatusEnum.PUBLISHED,
-          deletedAt: IsNull(),
-        },
-      });
-
-      for (const publishedView of publishedViews) {
-        try {
-          await this.publish(publishedView.ownerId, publishedView.id);
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : 'Không thể auto publish.';
-          this.logger.warn(
-            `Auto publish view ${publishedView.id} thất bại: ${errorMessage}`,
-          );
-        }
+    const normalizedRange =
+      selectionType === SelectionTypeEnum.RANGE ? range : null;
+    this.validateSelectionRules(
+      selectionType,
+      sourceSheetId,
+      normalizedRange ?? undefined,
+    );
+    if (selectionType === SelectionTypeEnum.RANGE) {
+      validateRangeA1Notation(normalizedRange!, Number.MAX_SAFE_INTEGER);
+    }
+    const sourceSheet = await manager.findOne(SourceSheet, {
+      where: { id: sourceSheetId!, dataSourceId: view.dataSourceId },
+    });
+    if (!sourceSheet) {
+      throw new NotFoundException(
+        'Không tìm thấy sheet trong nguồn dữ liệu này.',
+      );
+    }
+    if (changes.name !== undefined) {
+      if (typeof changes.name !== 'string' || !changes.name.trim()) {
+        throw new BadRequestException('name không được để trống.');
       }
-    } finally {
-      this.isAutoPublishRunning = false;
+      const name = changes.name.trim();
+      if (name !== view.name) {
+        view.slug = await this.generateUniqueSlug(manager, name, view.id);
+      }
+      view.name = name;
     }
+    Object.assign(view, {
+      sourceSheetId,
+      selectionType,
+      rangeA1Notation: normalizedRange,
+    });
+    // Share the same writable fields between draft saving and atomic publication.
+    const fields = [
+      'accessMode',
+      'useFirstRowAsHeader',
+      'refreshIntervalSeconds',
+      'allowThemeSwitch',
+      'themeId',
+      'themeOverrideJson',
+      'settingsJson',
+    ] as const;
+    for (const field of fields) {
+      if (changes[field] !== undefined) {
+        Object.assign(view, { [field]: changes[field] });
+      }
+    }
+  }
+
+  private viewConfiguration(view: View) {
+    return {
+      name: view.name,
+      slug: view.slug,
+      sourceSheetId: view.sourceSheetId,
+      selectionType: view.selectionType,
+      rangeA1Notation: view.rangeA1Notation,
+      accessMode: view.accessMode,
+      useFirstRowAsHeader: view.useFirstRowAsHeader,
+      refreshIntervalSeconds: view.refreshIntervalSeconds,
+      allowThemeSwitch: view.allowThemeSwitch,
+      themeId: view.themeId,
+      themeOverrideJson: view.themeOverrideJson,
+      settingsJson: view.settingsJson,
+    };
+  }
+
+  private publicationConfiguration(view: View): string {
+    return JSON.stringify({
+      ownerId: view.ownerId,
+      dataSourceId: view.dataSourceId,
+      status: view.status,
+      ...this.viewConfiguration(view),
+    });
+  }
+
+  private publicationResponse(
+    view: View,
+    snapshot: ViewSnapshot,
+  ): PublicationResult {
+    return {
+      id: view.id,
+      slug: view.slug,
+      status: view.status,
+      publishedAt: view.lastPublishedAt,
+      snapshot: {
+        id: snapshot.id,
+        versionNo: Number(snapshot.versionNo),
+        rowCount: snapshot.rowCount,
+        fetchedAt: snapshot.fetchedAt,
+      },
+      url: '/v/' + view.slug,
+    };
   }
 }

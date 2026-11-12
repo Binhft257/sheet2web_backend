@@ -56,6 +56,7 @@ export class ShareTokensService {
       id: savedToken.id,
       name,
       url: `/v/${view.slug}?shareToken=${rawToken}`,
+      canCopy: true,
       isRevoked: false,
       expiresAt: savedToken.expiresAt,
       createdAt: savedToken.createdAt,
@@ -70,9 +71,7 @@ export class ShareTokensService {
     });
 
     return {
-      items: shareTokens.map((shareToken) =>
-        this.toListResponse(shareToken, view.slug),
-      ),
+      items: shareTokens.map((shareToken) => this.toListResponse(shareToken)),
     };
   }
 
@@ -122,7 +121,7 @@ export class ShareTokensService {
     return view;
   }
 
-  private toListResponse(shareToken: ShareToken, slug: string) {
+  private toListResponse(shareToken: ShareToken) {
     const name =
       typeof shareToken.metadataJson?.name === 'string'
         ? shareToken.metadataJson.name
@@ -131,7 +130,10 @@ export class ShareTokensService {
     return {
       id: shareToken.id,
       name,
-      url: `/v/${slug}?shareToken=${shareToken.tokenPreview ?? 'masked'}`,
+      // Only the hash is stored. A masked preview must never be used as a URL.
+      url: null,
+      canCopy: false,
+      tokenPreview: shareToken.tokenPreview ?? null,
       isRevoked: shareToken.status === TokenStatusEnum.REVOKED,
       expiresAt: shareToken.expiresAt,
       createdAt: shareToken.createdAt,

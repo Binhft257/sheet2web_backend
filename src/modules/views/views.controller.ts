@@ -35,6 +35,7 @@ import { UpdateViewDto } from './dto/update-view.dto';
 import { JwtAuthGuard } from '../../auth/passport/jwt-auth.guard';
 import { Public } from '../../decorator/customize';
 import { JwtService } from '@nestjs/jwt';
+import { UsersService } from '../users/users.service';
 
 @ApiTags('View')
 @Controller('views')
@@ -274,6 +275,7 @@ export class PublicViewsController {
   constructor(
     private readonly viewsService: ViewsService,
     private readonly jwtService: JwtService,
+    private readonly usersService: UsersService,
   ) {}
 
   @Public()
@@ -316,7 +318,9 @@ export class PublicViewsController {
       const payload = await this.jwtService.verifyAsync<{ sub?: string }>(
         accessToken,
       );
-      return payload.sub;
+      if (!payload.sub) return undefined;
+      const user = await this.usersService.findActiveById(payload.sub);
+      return user?.id;
     } catch {
       return undefined;
     }

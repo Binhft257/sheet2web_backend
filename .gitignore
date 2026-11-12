@@ -18,6 +18,18 @@ lerna-debug.log*
 # Tests
 /coverage
 /.nyc_output
+/test/
+/tsconfig.spec.json
+**/*.spec.ts
+**/*.spec.tsx
+**/*.test.ts
+**/*.test.tsx
+/test-results/
+/playwright-report/
+
+# Local reports and working documents
+/docs/
+/qa-reports/
 
 # IDEs and editors
 /.idea
@@ -41,6 +53,25 @@ lerna-debug.log*
 .env.test.local
 .env.production.local
 .env.local
+.env.*
+!.env.example
+
+# Deployment output
+deploy_package.tar.gz
+__pycache__/
+*.py[cod]
+
+# local deployment helpers
+/release.py
+/ecosystem.config.js
+
+# local agent skills and instructions
+/.agents/
+/.claude/
+/.codex/
+/skills-lock.json
+/AGENTS.md
+/CLAUDE.md
 
 # temp directory
 .temp

@@ -17,9 +17,9 @@ export class AuthService {
     private jwtService: JwtService,
   ) {}
 
-  async validateUser(email: string, pass: string): Promise<any> {
+  async validateUser(email: string, pass: string): Promise<User> {
     const user = await this.usersService.findOneByEmail(email);
-    if (!user) {
+    if (!user || user.deletedAt || !user.passwordHash) {
       throw new UnauthorizedException('Email hoặc mật khẩu không đúng');
     }
 
@@ -34,7 +34,7 @@ export class AuthService {
     return user;
   }
 
-  async logIn(user: User): Promise<any> {
+  async logIn(user: User): Promise<{ access_token: string }> {
     const payload = { sub: user.id, email: user.email, role: user.role };
 
     return {
