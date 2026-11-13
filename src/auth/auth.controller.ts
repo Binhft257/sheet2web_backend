@@ -1,11 +1,4 @@
-import {
-  Request,
-  Controller,
-  Get,
-  Post,
-  Body,
-  UseGuards,
-} from '@nestjs/common';
+import { Request, Controller, Post, Body, UseGuards } from '@nestjs/common';
 import {
   ApiProperty,
   ApiBadRequestResponse,
@@ -26,7 +19,6 @@ import {
   ForgotPasswordDto,
   ResetPasswordDto,
 } from './dto/create-auth.dto';
-import { MailerService } from '@nestjs-modules/mailer';
 
 class RetryActivationDto {
   @ApiProperty({
@@ -41,10 +33,7 @@ type AuthenticatedRequest = ExpressRequest & { user: User };
 @ApiTags('Auth')
 @Controller('auth')
 export class AuthController {
-  constructor(
-    private readonly authService: AuthService,
-    private readonly mailerService: MailerService,
-  ) {}
+  constructor(private readonly authService: AuthService) {}
 
   @Public()
   @Post('login')
@@ -136,26 +125,5 @@ export class AuthController {
   })
   async resetPassword(@Body() resetPasswordDto: ResetPasswordDto) {
     return await this.authService.resetPassword(resetPasswordDto);
-  }
-
-  @Public()
-  @Get('mail')
-  @ApiOperation({
-    summary: 'Gửi email kiểm thử',
-    description: 'Gửi thử email theo mẫu đăng ký.',
-  })
-  @ApiOkResponse({ description: 'Đã gửi email kiểm thử.' })
-  async testMain() {
-    await this.mailerService.sendMail({
-      to: 'binhnguyen2572005@gmail.com',
-      subject: 'Welcome!',
-      text: 'welcome',
-      template: 'register.hbs',
-      context: {
-        name: 'Binh',
-        activationCode: 123456789,
-      },
-    });
-    return 'ok';
   }
 }

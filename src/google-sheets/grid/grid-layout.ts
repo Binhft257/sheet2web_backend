@@ -63,6 +63,7 @@ export type GoogleCell = {
     formulaValue?: string;
   };
   effectiveFormat?: {
+    numberFormat?: { type?: string };
     horizontalAlignment?: CellLayout['horizontalAlignment'];
     verticalAlignment?: CellLayout['verticalAlignment'];
     wrapStrategy?: CellLayout['wrapStrategy'];

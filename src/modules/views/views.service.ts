@@ -32,6 +32,10 @@ import {
   escapeSheetName,
   validateRangeA1Notation,
 } from '../data-sources/utils/sheet-range.util';
+import { Optional } from '@nestjs/common';
+import { SourceOperationLock } from '../../google-sheets/source-operation-lock';
+import { ViewAccessPolicy } from '../view-permissions/view-access.policy';
+import { sourceGoogleAccess } from '../../google-sheets/google-source-access';
 import { GoogleSheetsService } from '../../google-sheets/google-sheets.service';
 import { ViewSnapshot } from '../view-snapshots/entities/view-snapshot.entity';
 import { ViewPermission } from '../view-permissions/entities/view-permission.entity';
@@ -70,6 +74,8 @@ export class ViewsService {
     @InjectDataSource()
     private readonly typeOrmDataSource: TypeOrmDataSource,
     private readonly googleSheetsService: GoogleSheetsService,
+    @Optional() private readonly accessPolicy?: ViewAccessPolicy,
+    @Optional() private readonly sourceLocks?: SourceOperationLock,
   ) {}
 
   async listMy(userId: string, listMyViewsQueryDto: ListMyViewsQueryDto) {
@@ -103,8 +109,9 @@ export class ViewsService {
     }
 
     queryBuilder
-      .orderBy('view.updated_at', 'DESC')
-      .addOrderBy('view.created_at', 'DESC')
+      // Background sync must not move existing pages around the list.
+      .orderBy('view.created_at', 'DESC')
+      .addOrderBy('view.id', 'DESC')
       .skip(skip)
       .take(limit);
 
@@ -413,7 +420,7 @@ export class ViewsService {
       }
       return existing.promise;
     }
-    const promise = this.publishSnapshot(userId, viewId, request);
+    const promise = this.publishWithSourceLock(userId, viewId, request);
     this.publications.set(key, { ...request, promise });
     try {
       return await promise;
@@ -421,6 +428,32 @@ export class ViewsService {
       if (this.publications.get(key)?.promise === promise)
         this.publications.delete(key);
     }
+  }
+
+  private async publishWithSourceLock(
+    userId: string,
+    viewId: string,
+    request: PublicationRequest,
+  ): Promise<PublicationResult> {
+    if (this.sourceLocks) {
+      const view = await this.typeOrmDataSource.manager.findOne(View, {
+        where: { id: viewId, ownerId: userId, deletedAt: IsNull() },
+      });
+      const source =
+        view &&
+        (await this.typeOrmDataSource.manager.findOne(DataSourceEntity, {
+          where: {
+            id: view.dataSourceId,
+            ownerId: userId,
+            deletedAt: IsNull(),
+          },
+        }));
+      if (source?.spreadsheetId && sourceGoogleAccess(source))
+        return this.sourceLocks.run(source.spreadsheetId, () =>
+          this.publishSnapshot(userId, viewId, request),
+        );
+    }
+    return this.publishSnapshot(userId, viewId, request);
   }
 
   private async publishSnapshot(
@@ -510,6 +543,9 @@ export class ViewsService {
           ? candidate.rangeA1Notation!
           : undefined,
       useFirstRowAsHeader: candidate.useFirstRowAsHeader,
+      ...(sourceGoogleAccess(dataSource)
+        ? { googleAccess: sourceGoogleAccess(dataSource) }
+        : {}),
     });
     const resolvedRange = this.resolvePublishRange(candidate, grid.sheetName);
     const { headers, rows } = grid;
@@ -714,7 +750,13 @@ export class ViewsService {
       }
     }
 
-    return this.toPublishedResponse(view, currentSnapshot);
+    const response = this.toPublishedResponse(view, currentSnapshot);
+    return this.accessPolicy
+      ? {
+          ...response,
+          capabilities: await this.accessPolicy.capabilities(view, userId),
+        }
+      : response;
   }
 
   async remove(userId: string, viewId: string) {
@@ -756,8 +798,8 @@ export class ViewsService {
         .createQueryBuilder(ViewPermission, 'permission')
         .where('permission.view_id = :viewId', { viewId: view.id })
         .andWhere('permission.user_id = :userId', { userId })
-        .andWhere('permission.permission_type = :permissionType', {
-          permissionType: PermissionTypeEnum.VIEW,
+        .andWhere('permission.permission_type IN (:...permissionTypes)', {
+          permissionTypes: [PermissionTypeEnum.VIEW, PermissionTypeEnum.EDIT],
         })
         .getExists();
 
@@ -1064,6 +1106,8 @@ export class ViewsService {
         ? {
             id: dataSource.id,
             title: dataSource.title,
+            googleConnectionId:
+              sourceGoogleAccess(dataSource)?.connectionId ?? null,
             sourceType: dataSource.sourceType,
             sourceStatus: dataSource.sourceStatus,
             spreadsheetId: dataSource.spreadsheetId,

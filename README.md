@@ -245,7 +245,6 @@ All endpoints below include the `/api` global prefix.
 | POST   | `/api/auth/forgot-password` | Send a password reset code                   | No            |
 | POST   | `/api/auth/reset-password`  | Reset password with a valid code             | No            |
 | POST   | `/api/auth/login`           | Login and receive a JWT access token         | No            |
-| GET    | `/api/auth/mail`            | Send a hard-coded test email                 | No            |
 
 ### Users
 

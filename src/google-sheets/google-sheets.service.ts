@@ -6,6 +6,12 @@ import {
   InternalServerErrorException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { gridEditState, type GridEditState } from './grid/grid-edit-state';
+import { Optional } from '@nestjs/common';
+import {
+  GoogleConnectionsService,
+  type GoogleAccess,
+} from '../modules/google-connections/google-connections.service';
 import { ConfigService } from '@nestjs/config';
 import type { sheets_v4 } from 'googleapis';
 import { GoogleSheetsMetadata } from './types/google-sheets-metadata.type';
@@ -20,10 +26,10 @@ import { GridSnapshotMapper } from './grid/grid-snapshot.mapper';
 import { buildA1Range } from '../modules/data-sources/utils/sheet-range.util';
 
 const GRID_FIELDS = [
-  'sheets(properties(sheetId,title,hidden,sheetType,gridProperties(rowCount,columnCount)),merges,charts(chartId),',
+  'sheets(properties(sheetId,title,hidden,sheetType,gridProperties(rowCount,columnCount)),merges,protectedRanges(range),charts(chartId),',
   'data(startRow,startColumn,rowMetadata(pixelSize,hiddenByUser,hiddenByFilter),columnMetadata(pixelSize,hiddenByUser,hiddenByFilter),',
-  'rowData(values(formattedValue,effectiveValue(numberValue,boolValue,errorValue(type)),userEnteredValue(formulaValue),',
-  'effectiveFormat(horizontalAlignment,verticalAlignment,wrapStrategy)))))',
+  'rowData(values(formattedValue,effectiveValue(stringValue,numberValue,boolValue,errorValue(type)),userEnteredValue(stringValue,numberValue,boolValue,formulaValue),dataValidation,',
+  'effectiveFormat(horizontalAlignment,verticalAlignment,wrapStrategy,numberFormat(type))))))',
 ].join('');
 const REQUEST_OPTIONS = {
   timeout: 10_000,
@@ -58,6 +64,7 @@ export class GoogleSheetsService {
   constructor(
     private readonly configService: ConfigService,
     private readonly requests: GoogleSheetsRequestExecutor,
+    @Optional() private readonly connections?: GoogleConnectionsService,
   ) {}
 
   async getGridSnapshot(input: {
@@ -67,10 +74,15 @@ export class GoogleSheetsService {
     rangeA1Notation?: string;
     useFirstRowAsHeader: boolean;
     previewRows?: number;
-  }): Promise<GridSnapshot & { sheetName: string }> {
+    googleAccess?: GoogleAccess;
+    includeEditState?: boolean;
+  }): Promise<GridSnapshot & { sheetName: string; editState?: GridEditState }> {
     // Lightweight preflight prevents an unbounded grid download and resolves renamed tabs by ID.
     // This only reads metadata; deletion is exclusively the owner's explicit tab-sync operation.
-    const metadata = await this.getSpreadsheetMetadata(input.spreadsheetId);
+    const metadata = await this.getSpreadsheetMetadata(
+      input.spreadsheetId,
+      input.googleAccess,
+    );
     const tab = metadata.sheets.find((sheet) =>
       input.googleSheetId != null
         ? sheet.googleSheetId === input.googleSheetId
@@ -85,10 +97,7 @@ export class GoogleSheetsService {
     const rows = Number(tab.metadataJson.rowCount);
     const columns = Number(tab.metadataJson.columnCount);
     const range = resolveGridRange(input.rangeA1Notation, rows, columns);
-    const apiKey = this.configService.get<string>('GOOGLE_SHEETS_API_KEY');
-    if (!apiKey)
-      throw new InternalServerErrorException('Thiếu GOOGLE_SHEETS_API_KEY');
-    const client = this.createSheetsClient(apiKey);
+    const client = await this.client(input.googleAccess);
     const response = await this.requests.run(() =>
       client.spreadsheets.get(
         {
@@ -142,25 +151,25 @@ export class GoogleSheetsService {
           'Chưa đủ metadata để kiểm tra cột bị ẩn. Không xuất bản dữ liệu.',
         );
     }
+    const grid = this.mapper.map(sheet, range, {
+      fullSheet: !input.rangeA1Notation,
+      useFirstRowAsHeader: input.useFirstRowAsHeader,
+      previewRows: input.previewRows,
+    });
     return {
-      ...this.mapper.map(sheet, range, {
-        fullSheet: !input.rangeA1Notation,
-        useFirstRowAsHeader: input.useFirstRowAsHeader,
-        previewRows: input.previewRows,
-      }),
+      ...grid,
       sheetName: sheet.properties?.title ?? tab.sheetName,
+      ...(input.includeEditState
+        ? { editState: gridEditState(sheet, grid) }
+        : {}),
     };
   }
 
   async getSpreadsheetMetadata(
     spreadsheetId: string,
+    access?: GoogleAccess,
   ): Promise<GoogleSheetsMetadata> {
-    const apiKey = this.configService.get<string>('GOOGLE_SHEETS_API_KEY');
-    if (!apiKey) {
-      throw new InternalServerErrorException('Thiếu GOOGLE_SHEETS_API_KEY');
-    }
-
-    const sheets = this.createSheetsClient(apiKey);
+    const sheets = await this.client(access);
 
     try {
       const response = await this.requests.run(() =>
@@ -267,6 +276,18 @@ export class GoogleSheetsService {
     } catch (error) {
       this.handleValuesError(error);
     }
+  }
+
+  private async client(access?: GoogleAccess): Promise<sheets_v4.Sheets> {
+    if (access) {
+      if (!this.connections)
+        throw new InternalServerErrorException('Kết nối Google chưa sẵn sàng.');
+      return this.connections.client(access);
+    }
+    const key = this.configService.get<string>('GOOGLE_SHEETS_API_KEY');
+    if (!key)
+      throw new InternalServerErrorException('Thiếu GOOGLE_SHEETS_API_KEY');
+    return this.createSheetsClient(key);
   }
 
   private createSheetsClient(apiKey: string): sheets_v4.Sheets {

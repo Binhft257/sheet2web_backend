@@ -7,6 +7,7 @@
   Param,
   ParseUUIDPipe,
   Post,
+  Patch,
   Req,
   UnauthorizedException,
   UseGuards,
@@ -26,6 +27,7 @@ import {
 } from '@nestjs/swagger';
 import type { Request } from 'express';
 import { ViewPermissionsService } from './view-permissions.service';
+import { UpdateViewPermissionDto } from './dto/update-view-permission.dto';
 import { CreateViewPermissionDto } from './dto/create-view-permission.dto';
 import { JwtAuthGuard } from '../../auth/passport/jwt-auth.guard';
 
@@ -110,6 +112,21 @@ export class ViewPermissionsController {
     }
 
     return this.viewPermissionsService.findAll(userId, viewId);
+  }
+
+  @Patch(':permissionId')
+  updateRole(
+    @Req() req: Request & { user: { id: string } },
+    @Param('viewId', ParseUUIDPipe) viewId: string,
+    @Param('permissionId', ParseUUIDPipe) permissionId: string,
+    @Body() dto: UpdateViewPermissionDto,
+  ) {
+    return this.viewPermissionsService.updateRole(
+      req.user.id,
+      viewId,
+      permissionId,
+      dto.role,
+    );
   }
 
   @Delete(':permissionId')

@@ -15,10 +15,68 @@ export function googleErrorStatus(error: unknown): number | undefined {
   return typeof status === 'number' ? status : undefined;
 }
 
+/** A denied read may need OAuth; configuration and quota errors do not. */
+export function canRequestGoogleAccess(error: unknown): boolean {
+  if (![403, 404].includes(googleErrorStatus(error) ?? 0)) return false;
+  const payload = (
+    error as {
+      response?: {
+        data?: {
+          error?: {
+            errors?: Array<{ reason?: string }>;
+            details?: Array<{ reason?: string }>;
+          };
+        };
+      };
+    }
+  ).response?.data?.error;
+  const excluded = new Set([
+    'accessNotConfigured',
+    'SERVICE_DISABLED',
+    'API_KEY_INVALID',
+    'API_KEY_SERVICE_BLOCKED',
+    'API_KEY_HTTP_REFERRER_BLOCKED',
+    'API_KEY_IP_ADDRESS_BLOCKED',
+    'rateLimitExceeded',
+    'userRateLimitExceeded',
+    'dailyLimitExceeded',
+    'RATE_LIMIT_EXCEEDED',
+  ]);
+  return ![...(payload?.errors ?? []), ...(payload?.details ?? [])].some(
+    ({ reason }) => reason && excluded.has(reason),
+  );
+}
+
 /** One shared gate for metadata, grid, preview and legacy reads. */
 @Injectable()
 export class GoogleSheetsRequestExecutor {
   private active = 0;
+  private readonly requestTimes = {
+    read: [] as number[],
+    write: [] as number[],
+  };
+
+  private checkQuota(kind: 'read' | 'write') {
+    const now = Date.now();
+    const times = this.requestTimes[kind];
+    while (times.length && times[0] <= now - 60000) times.shift();
+    if (times.length >= (kind === 'read' ? 50 : 40))
+      throw new HttpException(
+        'Đang có nhiều yêu cầu Google Sheets. Các thay đổi sẽ được thử lại sau.',
+        429,
+      );
+    times.push(now);
+  }
+
+  async runWrite<T>(operation: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      this.checkQuota('write');
+      return await operation();
+    } finally {
+      this.release();
+    }
+  }
   private readonly waiting: Array<() => void> = [];
   private readonly concurrency = 2;
 
@@ -27,6 +85,7 @@ export class GoogleSheetsRequestExecutor {
       await this.acquire();
       let failure: unknown;
       try {
+        this.checkQuota('read');
         return await operation();
       } catch (error) {
         failure = error;
@@ -36,9 +95,15 @@ export class GoogleSheetsRequestExecutor {
       if (failure instanceof HttpException) throw failure;
       const status = googleErrorStatus(failure);
       if (status === 400 || status === 403 || status === 404) {
-        throw new BadRequestException(
-          'Không đọc được Google Sheets. Kiểm tra quyền truy cập, tab và phạm vi đã chọn.',
-        );
+        throw new BadRequestException({
+          statusCode: 400,
+          error: 'Bad Request',
+          message:
+            'Không đọc được Google Sheets. Kiểm tra quyền truy cập, tab và phạm vi đã chọn.',
+          ...(canRequestGoogleAccess(failure)
+            ? { code: 'GOOGLE_SHEETS_ACCESS_REQUIRED' }
+            : {}),
+        });
       }
       const temporary =
         status === undefined ||

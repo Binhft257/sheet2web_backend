@@ -27,6 +27,7 @@ import {
 } from '../../common/enums/database.enums';
 import { GoogleSheetsService } from '../../google-sheets/google-sheets.service';
 import { extractSpreadsheetId } from './utils/extract-spreadsheet-id';
+import { sourceGoogleAccess } from '../../google-sheets/google-source-access';
 import { randomUUID } from 'node:crypto';
 import {
   GoogleSheetTabMetadata,
@@ -98,6 +99,8 @@ export class DataSourcesService {
       items: dataSources.map((dataSource) => ({
         id: dataSource.id,
         title: dataSource.title,
+        googleConnectionId:
+          sourceGoogleAccess(dataSource)?.connectionId ?? null,
         sourceType: dataSource.sourceType,
         sourceStatus: dataSource.sourceStatus,
         spreadsheetId: dataSource.spreadsheetId,
@@ -175,8 +178,15 @@ export class DataSourcesService {
   async create(userId: string, createDataSourceDto: CreateDataSourceDto) {
     const sourceUrl = createDataSourceDto.sourceUrl.trim();
     const spreadsheetId = extractSpreadsheetId(sourceUrl);
-    const metadata =
-      await this.googleSheetsService.getSpreadsheetMetadata(spreadsheetId);
+    const metadata = await this.googleSheetsService.getSpreadsheetMetadata(
+      spreadsheetId,
+      createDataSourceDto.googleConnectionId
+        ? {
+            ownerId: userId,
+            connectionId: createDataSourceDto.googleConnectionId,
+          }
+        : undefined,
+    );
 
     this.validateMetadataHasSheets(metadata);
 
@@ -192,7 +202,12 @@ export class DataSourcesService {
           sourceUrl,
           spreadsheetId,
           title: resolvedTitle,
-          connectionMetaJson: this.buildConnectionMeta(metadata),
+          connectionMetaJson: {
+            ...this.buildConnectionMeta(metadata),
+            ...(createDataSourceDto.googleConnectionId
+              ? { googleConnectionId: createDataSourceDto.googleConnectionId }
+              : {}),
+          },
           lastSyncedStructureAt: new Date(),
         });
 
@@ -245,16 +260,22 @@ export class DataSourcesService {
     let spreadsheetId: string | undefined;
     let metadata: GoogleSheetsMetadata | undefined;
 
-    if (hasSourceUrl) {
-      sourceUrl = incomingSourceUrl.trim();
+    const connectionId =
+      updateDataSourceDto.googleConnectionId === undefined
+        ? sourceGoogleAccess(original)?.connectionId
+        : updateDataSourceDto.googleConnectionId;
+    if (hasSourceUrl || updateDataSourceDto.googleConnectionId !== undefined) {
+      sourceUrl = hasSourceUrl ? incomingSourceUrl.trim() : original.sourceUrl;
       spreadsheetId = extractSpreadsheetId(sourceUrl);
       if (original.spreadsheetId && original.spreadsheetId !== spreadsheetId) {
         throw new ConflictException(
           'Không thể thay spreadsheet của nguồn hiện có vì có thể xóa các trang liên quan. Hãy thêm nguồn mới.',
         );
       }
-      metadata =
-        await this.googleSheetsService.getSpreadsheetMetadata(spreadsheetId);
+      metadata = await this.googleSheetsService.getSpreadsheetMetadata(
+        spreadsheetId,
+        connectionId ? { ownerId: userId, connectionId } : undefined,
+      );
       this.validateMetadataHasSheets(metadata);
     }
 
@@ -277,7 +298,9 @@ export class DataSourcesService {
 
         if (
           metadata &&
-          (dataSource.spreadsheetId !== original.spreadsheetId ||
+          (sourceGoogleAccess(dataSource)?.connectionId !==
+            sourceGoogleAccess(original)?.connectionId ||
+            dataSource.spreadsheetId !== original.spreadsheetId ||
             (dataSource.lastSyncedStructureAt?.getTime() ?? null) !==
               expectedStructureTime)
         ) {
@@ -289,7 +312,11 @@ export class DataSourcesService {
         if (metadata && sourceUrl && spreadsheetId) {
           dataSource.sourceUrl = sourceUrl;
           dataSource.spreadsheetId = spreadsheetId;
-          dataSource.connectionMetaJson = this.buildConnectionMeta(metadata);
+          dataSource.connectionMetaJson = {
+            ...dataSource.connectionMetaJson,
+            ...this.buildConnectionMeta(metadata),
+            googleConnectionId: connectionId ?? null,
+          };
           dataSource.lastSyncedStructureAt = new Date();
         }
 
@@ -458,6 +485,9 @@ export class DataSourcesService {
       rangeA1Notation: normalizedRange || undefined,
       useFirstRowAsHeader: previewDataSourceDto.useFirstRowAsHeader ?? true,
       previewRows: PREVIEW_MAX_ROWS,
+      ...(sourceGoogleAccess(dataSource)
+        ? { googleAccess: sourceGoogleAccess(dataSource) }
+        : {}),
     });
     return {
       dataSourceId: dataSource.id,
@@ -529,6 +559,7 @@ export class DataSourcesService {
     return {
       id: dataSource.id,
       title: dataSource.title,
+      googleConnectionId: sourceGoogleAccess(dataSource)?.connectionId ?? null,
       sourceType: dataSource.sourceType,
       sourceStatus: dataSource.sourceStatus,
       spreadsheetId: dataSource.spreadsheetId,

@@ -1,6 +1,5 @@
-import { PartialType } from '@nestjs/swagger';
-import { CreateViewPermissionDto } from './create-view-permission.dto';
+import { IsIn } from 'class-validator';
 
-export class UpdateViewPermissionDto extends PartialType(
-  CreateViewPermissionDto,
-) {}
+export class UpdateViewPermissionDto {
+  @IsIn(['viewer', 'editor']) role!: 'viewer' | 'editor';
+}

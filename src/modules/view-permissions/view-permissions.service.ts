@@ -52,13 +52,26 @@ export class ViewPermissionsService {
     );
 
     if (existedPermission) {
+      if (createViewPermissionDto.role) {
+        existedPermission.permissionType =
+          createViewPermissionDto.role === 'editor'
+            ? PermissionTypeEnum.EDIT
+            : PermissionTypeEnum.VIEW;
+        await this.typeOrmDataSource.manager.save(
+          ViewPermission,
+          existedPermission,
+        );
+      }
       return this.toResponse(existedPermission);
     }
 
     const permission = this.typeOrmDataSource.manager.create(ViewPermission, {
       viewId: view.id,
       userId: targetUser.id,
-      permissionType: PermissionTypeEnum.VIEW,
+      permissionType:
+        createViewPermissionDto.role === 'editor'
+          ? PermissionTypeEnum.EDIT
+          : PermissionTypeEnum.VIEW,
       grantedBy: userId,
     });
 
@@ -85,6 +98,24 @@ export class ViewPermissionsService {
     return {
       items: permissions.map((permission) => this.toResponse(permission)),
     };
+  }
+
+  async updateRole(
+    userId: string,
+    viewId: string,
+    permissionId: string,
+    role: 'viewer' | 'editor',
+  ) {
+    await this.findOwnedView(userId, viewId);
+    const grant = await this.typeOrmDataSource.manager.findOne(ViewPermission, {
+      where: { id: permissionId, viewId },
+      relations: { user: true },
+    });
+    if (!grant) throw new NotFoundException('Không tìm thấy quyền truy cập.');
+    grant.permissionType =
+      role === 'editor' ? PermissionTypeEnum.EDIT : PermissionTypeEnum.VIEW;
+    await this.typeOrmDataSource.manager.save(ViewPermission, grant);
+    return this.toResponse(grant);
   }
 
   async remove(userId: string, viewId: string, permissionId: string) {
@@ -132,7 +163,10 @@ export class ViewPermissionsService {
         email: permission.user.email,
         name: permission.user.fullName,
       },
-      role: 'viewer',
+      role:
+        permission.permissionType === PermissionTypeEnum.EDIT
+          ? 'editor'
+          : 'viewer',
       createdAt: permission.createdAt,
     };
   }
